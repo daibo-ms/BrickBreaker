@@ -1,0 +1,713 @@
+import pygame
+import random
+import math
+import sys
+import numpy as np
+from pygame import mixer
+from scipy.signal import convolve2d
+
+# 初始化Pygame
+pygame.init()
+mixer.init()
+
+# 全局变量定义
+COLORS = {
+    'background': (0, 0, 0),
+    'background2': (25, 25, 40),
+    'paddle': (46, 204, 113),
+    'ball': (52, 152, 219),
+    'brick': [
+        (231, 76, 60),    # 红色
+        (155, 89, 182),   # 紫色
+        (241, 196, 15),   # 黄色
+        (26, 188, 156)    # 青色
+    ],
+    'reward': (241, 196, 15),  # 金色
+    'trail' : (100, 100, 155),  # 将原(200, 200, 255)改为更暗的蓝灰色
+    'particle': (255, 150, 50)
+}
+
+SOUND_ENABLED = True
+MAX_CONCURRENT_SOUNDS = 8
+PARTICLE_GROUP = pygame.sprite.Group()
+SHAKE_DURATION = 0
+SCREEN_SHAKE = 0
+BG_OFFSET = 0
+SCREEN_WIDTH = 1280  # 默认值
+SCREEN_HEIGHT = 720
+FULLSCREEN_MODE = False
+screen = None  # 初始化为None
+
+# 初始化显示
+#try:
+#    display_info = pygame.display.Info()
+#    SCREEN_WIDTH = display_info.current_w
+#    SCREEN_HEIGHT = display_info.current_h
+#    screen = pygame.display.set_mode(
+#        (SCREEN_WIDTH, SCREEN_HEIGHT),
+#        pygame.FULLSCREEN | pygame.HWSURFACE | pygame.DOUBLEBUF
+#    )
+#    FULLSCREEN_MODE = True
+#except Exception as e:
+#print(f"全屏初始化失败: {e}")
+SCREEN_WIDTH, SCREEN_HEIGHT = 1280, 720
+screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+FULLSCREEN_MODE = False
+
+pygame.display.set_caption("高级砖块挑战")
+
+# 音频系统
+def generate_sound(sound_type, frequency=440, duration=0.1):
+    sample_rate = 44100
+    num_samples = int(sample_rate * duration)
+    t = np.linspace(0, duration, num_samples, False)
+    
+    if sound_type == 'wood':
+        main_wave = 0.6 * np.sin(2 * np.pi * 120 * t)
+        harmonic1 = 0.4 * np.sin(2 * np.pi * 240 * t) * np.exp(-t*15)
+        harmonic2 = 0.3 * np.sin(2 * np.pi * 360 * t) * np.exp(-t*20)
+        noise = 0.2 * np.random.normal(0, 1, num_samples) * np.exp(-t*25)
+        combined = main_wave + harmonic1 + harmonic2 + noise
+        envelope = np.exp(-t*12)
+    elif sound_type == 'glass':
+        main_wave = 0.5 * np.sign(np.sin(2 * np.pi * 2200 * t))
+        harmonic1 = 0.4 * np.sign(np.sin(2 * np.pi * 3300 * t)) * np.exp(-t*25)
+        harmonic2 = 0.3 * np.sign(np.sin(2 * np.pi * 4400 * t)) * np.exp(-t*30)
+        noise = 0.3 * np.random.normal(0, 1, num_samples) * np.exp(-t*50)
+        combined = main_wave + harmonic1 + harmonic2 + noise
+        envelope = np.exp(-t*30)
+        
+    wave = combined * envelope
+    max_amp = np.max(np.abs(wave))
+    if max_amp > 0:
+        wave = wave * (0.9 / max_amp)
+    
+    stereo_wave = np.column_stack((wave, wave))
+    audio_data = (stereo_wave * 32767).astype(np.int16)
+    return pygame.sndarray.make_sound(audio_data)
+
+SOUNDS = {
+    'paddle': generate_sound('wood', duration=0.08),
+    'brick': generate_sound('glass', duration=0.15)
+}
+
+class AudioManager:
+    def __init__(self):
+        self.channels = [mixer.Channel(i) for i in range(MAX_CONCURRENT_SOUNDS)]
+        self.next_channel = 0
+    
+    def play(self, sound_key, pan=0):
+        if not SOUND_ENABLED:
+            return
+        
+        channel = self.channels[self.next_channel]
+        sound = SOUNDS[sound_key]  # 直接使用原声效对象
+        
+        # 立体声平衡
+        left = min(1.0, 0.5 + (1 - pan) * 0.5)
+        right = min(1.0, 0.5 + (1 + pan) * 0.5)
+        channel.set_volume(min(1.0, left), min(1.0, right))  # 确保不超过1.0
+        #sound.set_volume(left, right)
+        
+        if not channel.get_busy():
+            try:
+                channel.play(sound)
+            except Exception as e:
+                print(f"音效播放失败: {e}")
+        self.next_channel = (self.next_channel + 1) % MAX_CONCURRENT_SOUNDS
+
+audio_manager = AudioManager()
+
+# 游戏对象
+class Particle(pygame.sprite.Sprite):
+    def __init__(self, position, color):
+        super().__init__()
+        self.size = random.randint(3, 6)
+        self.image = pygame.Surface((self.size*2, self.size*2), pygame.SRCALPHA)
+        pygame.draw.circle(self.image, (*color, 255), (self.size, self.size), self.size)
+        self.rect = self.image.get_rect(center=position)
+        self.velocity = [random.uniform(-3, 3), random.uniform(-5, 0)]
+        self.timer = 0
+        self.lifespan = random.randint(10, 20)
+
+    def update(self):
+        self.timer += 1
+        self.rect.x += self.velocity[0]
+        self.rect.y += self.velocity[1]
+        self.velocity[1] += 0.2
+        alpha = 255 * (1 - self.timer/self.lifespan)
+        self.image.set_alpha(alpha)
+        if self.timer > self.lifespan:
+            self.kill()
+
+class Paddle(pygame.sprite.Sprite):
+    def __init__(self):
+        super().__init__()
+        self.base_width = int(SCREEN_WIDTH * 0.15)
+        self.width = self.base_width
+        self.height = max(10, int(SCREEN_HEIGHT * 0.025))
+        self.image = pygame.Surface((self.width, self.height))
+        self.image.fill(COLORS['paddle'])
+        self.rect = self.image.get_rect(center=(SCREEN_WIDTH//2, SCREEN_HEIGHT-50))
+        self.speed = int(SCREEN_WIDTH * 0.02)
+        self.powerup_timer = 0
+
+    def update(self):
+        mouse_x, _ = pygame.mouse.get_pos()
+        self.rect.centerx = max(self.width//2, min(SCREEN_WIDTH-self.width//2, mouse_x))
+        
+        if self.powerup_timer > 0:
+            new_width = int(self.base_width * 1.5)
+            if self.width != new_width:
+                self.width = new_width
+                self.image = pygame.transform.scale(self.image, (self.width, self.height))
+                self.rect = self.image.get_rect(center=self.rect.center)
+            self.powerup_timer -= 1
+        else:
+            if self.width != self.base_width:
+                self.width = self.base_width
+                self.image = pygame.transform.scale(self.image, (self.width, self.height))
+                self.rect = self.image.get_rect(center=self.rect.center)
+
+class Ball(pygame.sprite.Sprite):
+    def __init__(self, paddle, speed_x=0, speed_y=0):
+        super().__init__()
+        self.radius = max(8, int(SCREEN_HEIGHT * 0.015))
+        self.image = pygame.Surface((self.radius*2, self.radius*2), pygame.SRCALPHA)
+        self._create_visual()
+        self.rect = self.image.get_rect(midbottom=paddle.rect.midtop)
+        self.base_speed = max(5.0, SCREEN_HEIGHT * 0.015)
+        self.speed_x = speed_x
+        self.speed_y = speed_y
+        self.is_stuck = True
+        self.is_lost = False
+        self.paddle = paddle
+        self.can_split = True
+        self.trail = []
+        self.max_trail = 10
+        self._initialize_speed(speed_x, speed_y)
+
+    def _create_visual(self):
+        for i in range(self.radius, 0, -1):
+            alpha = int(255 * (i/self.radius))
+            color = (*COLORS['ball'], alpha)
+            pygame.draw.circle(self.image, color, (self.radius, self.radius), i)
+
+    def _initialize_speed(self, speed_x, speed_y):
+        if speed_x == 0 and speed_y == 0:
+            angle = math.radians(random.randint(30, 150))
+            self.speed_x = self.base_speed * math.cos(angle)
+            self.speed_y = -self.base_speed * math.sin(angle)
+        else:
+            self.speed_x = speed_x
+            self.speed_y = speed_y
+        self._adjust_angle()
+
+    def _adjust_angle(self):
+        total_speed = math.hypot(self.speed_x, self.speed_y)
+        min_vertical = total_speed * 0.25
+        min_horizontal = total_speed * 0.1
+        
+        if abs(self.speed_y) < min_vertical:
+            vertical_sign = -1 if self.speed_y < 0 else 1
+            self.speed_y = vertical_sign * min_vertical
+            self.speed_x = math.copysign(
+                max(min_horizontal, math.sqrt(total_speed**2 - self.speed_y**2)),
+                self.speed_x
+            )
+        
+        if abs(self.speed_x) < min_horizontal:
+            horizontal_sign = -1 if self.speed_x < 0 else 1
+            self.speed_x = horizontal_sign * min_horizontal
+            self.speed_y = math.copysign(
+                math.sqrt(total_speed**2 - self.speed_x**2),
+                self.speed_y
+            )
+
+    def bounce(self, other):
+        if self.rect.colliderect(other.rect) and not self.is_stuck:
+            offset = (self.rect.centerx - other.rect.centerx) / (other.rect.width/2)
+            self.speed_x = offset * self.base_speed
+            self.speed_y = -abs(self.speed_y)
+            self._adjust_angle()
+            audio_manager.play('paddle', pan=offset)
+            return True
+        return False
+
+    def update(self):
+        if self.is_lost: 
+            return
+        
+        self.trail.append((self.rect.center, pygame.time.get_ticks()))
+        if len(self.trail) > self.max_trail:
+            self.trail.pop(0)
+        
+        if self.is_stuck:
+            self.rect.midbottom = self.paddle.rect.midtop
+            return
+        
+        new_x = self.rect.x + self.speed_x
+        new_y = self.rect.y + self.speed_y
+
+        if new_x <= 0:
+            self.speed_x = abs(self.speed_x)
+            new_x = 0
+        elif new_x + self.radius*2 >= SCREEN_WIDTH:
+            self.speed_x = -abs(self.speed_x)
+            new_x = SCREEN_WIDTH - self.radius*2
+
+        if new_y <= 0:
+            self.speed_y = abs(self.speed_y)
+            new_y = 0
+
+        self.rect.x = new_x
+        self.rect.y = new_y
+
+        if self.rect.bottom >= SCREEN_HEIGHT:
+            self.is_lost = True
+            self.kill()
+
+    def launch(self):
+        if self.is_stuck:
+            self.is_stuck = False
+
+    def draw_trail(self, surface):
+        now = pygame.time.get_ticks()
+        # 先绘制拖影（在球体下方）
+        for pos, timestamp in self.trail:
+            time_diff = now - timestamp
+            alpha = int(255 * (1 - time_diff/300)**1.5)  # 非线性衰减更自然
+            if alpha > 30:  # 过滤低透明度绘制
+                trail_surf = pygame.Surface((self.radius*2, self.radius*2), pygame.SRCALPHA)
+                pygame.draw.circle(
+                    trail_surf, 
+                    (*COLORS['trail'], alpha),
+                    (self.radius, self.radius),
+                    self.radius
+                )
+                surface.blit(trail_surf, (pos[0]-self.radius, pos[1]-self.radius))        
+        # 最后绘制球体本身（显示在最上层）
+        surface.blit(self.image, self.rect.topleft)
+
+class ArtisticBrick(pygame.sprite.Sprite):
+    def __init__(self, x, y, width, height, color, is_reward=False):
+        super().__init__()
+        self.width = width
+        self.height = height
+        self.image = pygame.Surface((self.width, self.height))
+        self._create_texture(color, is_reward)
+        self.rect = self.image.get_rect(topleft=(x, y))
+        self.is_reward = is_reward
+
+    def _create_texture(self, base_color, is_reward):
+        if is_reward:
+            self.image.fill(COLORS['reward'])
+            for _ in range(3):
+                pos = (random.randint(0,self.width), random.randint(0,self.height))
+                pygame.draw.circle(self.image, (255,255,100), pos, 2)
+        else:
+            noise = np.random.randint(-10, 10, (self.width, self.height, 3))
+            color_array = np.clip(np.array(base_color) + noise, 0, 255)
+            for x in range(self.width):
+                for y in range(self.height):
+                    self.image.set_at((x, y), tuple(color_array[x, y]))
+
+# 游戏逻辑
+def generate_artistic_pattern(level):
+    cols, rows = 40, 16
+    grid = np.zeros((rows, cols), dtype=bool)
+    center = (cols//2, rows//2)
+    
+    complexity = 0.4 + 0.06 * min(level, 50)
+    symmetry_level = 2 + int(complexity * 4)
+    seed = hash(str(level)) % 1000
+
+    pattern_type = ['fractal', 'wave', 'crystal'][seed % 3]
+    
+    if pattern_type == 'fractal':
+        x = np.linspace(-2, 2, cols)
+        y = np.linspace(-1.5, 1.5, rows)
+        c = x[:, np.newaxis] + 1j*y[np.newaxis, :]
+        z = np.zeros_like(c)
+        for _ in range(int(10 + complexity*20)):
+            z = z**2 + c
+        grid = (abs(z) < 4).T
+
+    elif pattern_type == 'wave':
+        x, y = np.meshgrid(np.linspace(-np.pi, np.pi, cols),
+                          np.linspace(-np.pi, np.pi, rows))
+        wave = (np.sin(x*3 + level) * np.cos(y*2) + \
+               np.sin(np.hypot(x,y)*5 + level*0.5))
+        grid = wave > (0.5 - complexity*0.3)
+
+    elif pattern_type == 'crystal':
+        kernel = np.array([[0,1,0],[1,1,1],[0,1,0]])
+        grid[center[1]-1:center[1]+2, center[0]-1:center[0]+2] = True
+        for _ in range(int(3 + complexity*5)):
+            grid = convolve2d(grid, kernel, mode='same') > 0
+
+    noise = generate_perlin(cols, rows, seed=seed, 
+                           scale=max(3, 10-complexity*8))
+    grid ^= (noise > (0.5 + complexity*0.2))
+
+    symmetry_ops = [
+        lambda x: x,
+        lambda x: np.fliplr(x),
+        lambda x: np.flipud(x),
+        lambda x: np.rot90(x, 2)
+    ]
+    for _ in range(symmetry_level):
+        op = symmetry_ops[seed % len(symmetry_ops)]
+        grid |= op(grid)
+        seed = seed // len(symmetry_ops)
+
+    grid[:2, :] = grid[-2:, :] = False
+    grid = convolve2d(grid, [[1,2,1],[2,4,2],[1,2,1]], 
+                     mode='same') > 6
+    
+    return grid.tolist()
+
+def generate_perlin(width, height, seed=0, scale=5):
+    np.random.seed(seed)
+    x = np.linspace(0, 1, width)
+    y = np.linspace(0, 1, height)
+    xv, yv = np.meshgrid(x, y)
+    
+    noise = np.zeros((height, width))
+    for octave in range(4):
+        freq = 2 ** octave
+        amp = 0.5 ** octave
+        x_grid = np.linspace(0, scale*freq, width, endpoint=False)
+        y_grid = np.linspace(0, scale*freq, height, endpoint=False)
+        xv, yv = np.meshgrid(x_grid, y_grid)
+        
+        rand_angles = 2*np.pi*np.random.rand(
+            int(scale*freq)+1, int(scale*freq)+1)
+        grad_x = np.cos(rand_angles)
+        grad_y = np.sin(rand_angles)
+        
+        x0 = xv.astype(int)
+        y0 = yv.astype(int)
+        x1 = x0 + 1
+        y1 = y0 + 1
+        
+        dx = xv - x0
+        dy = yv - y0
+        n0 = grad_x[y0%grad_x.shape[0], x0%grad_x.shape[1]] * dx + \
+             grad_y[y0%grad_y.shape[0], x0%grad_y.shape[1]] * dy
+        n1 = grad_x[y0%grad_x.shape[0], x1%grad_x.shape[1]] * (dx-1) + \
+             grad_y[y0%grad_y.shape[0], x1%grad_y.shape[1]] * dy
+        ix0 = n0*(1-dx) + n1*dx
+        
+        n0 = grad_x[y1%grad_x.shape[0], x0%grad_x.shape[1]] * dx + \
+             grad_y[y1%grad_y.shape[0], x0%grad_y.shape[1]] * (dy-1)
+        n1 = grad_x[y1%grad_x.shape[0], x1%grad_x.shape[1]] * (dx-1) + \
+             grad_y[y1%grad_y.shape[0], x1%grad_y.shape[1]] * (dy-1)
+        ix1 = n0*(1-dx) + n1*dx
+        
+        noise += (ix0*(1-dy) + ix1*dy) * amp
+    
+    return (noise - noise.min()) / (noise.max() - noise.min())
+
+def generate_bricks(level):
+    bricks = pygame.sprite.Group()
+    grid = generate_artistic_pattern(level)
+    cols = len(grid[0])
+    rows = len(grid)
+    
+    left_margin = random.randint(1, 3)
+    right_margin = random.randint(1, 3)
+    visible_cols = cols - left_margin - right_margin
+    
+    brick_h = max(18, int(SCREEN_HEIGHT * 0.027))
+    brick_w = int(brick_h * 4 / 3)
+    
+    h_spacing = int(SCREEN_WIDTH * 0.002)
+    v_spacing = int(SCREEN_HEIGHT * 0.004)
+    
+    total_width = visible_cols * (brick_w + h_spacing) - h_spacing
+    start_x = (SCREEN_WIDTH - total_width) // 2
+    pos_y = int(SCREEN_HEIGHT * 0.12)
+    
+    base_color = COLORS['brick'][(level-1) % len(COLORS['brick'])]
+    accent_color = COLORS['brick'][(level) % len(COLORS['brick'])]
+    
+    for y, row in enumerate(grid):
+        visible_row = row[left_margin : cols-right_margin]
+        for x, exists in enumerate(visible_row):
+            if exists:
+                pos_x = start_x + x * (brick_w + h_spacing)
+                current_y = pos_y + y * (brick_h + v_spacing)
+                center_x = visible_cols // 2
+                center_y = rows // 2
+                dx = (x - center_x)/center_x
+                dy = (y - center_y)/center_y
+                mix = 0.4 * (abs(dx) + abs(dy)) + 0.2 * math.sin(level*0.5)
+                color = tuple(int(b*(1-mix) + a*mix) for b,a in zip(base_color, accent_color))
+                is_reward = random.random() < 0.15
+                bricks.add(ArtisticBrick(pos_x, current_y, brick_w, brick_h, color, is_reward))
+    return bricks
+
+def split_ball(original_ball, paddle):
+    new_balls = pygame.sprite.Group()
+    base_angle = math.atan2(original_ball.speed_y, original_ball.speed_x)
+    
+    for offset in [math.radians(30), math.radians(-30)]:
+        new_angle = base_angle + offset
+        speed = math.hypot(original_ball.speed_x, original_ball.speed_y)
+        new_ball = Ball(paddle, speed * math.cos(new_angle), speed * math.sin(new_angle))
+        new_ball.rect = original_ball.rect.copy()
+        new_ball.is_stuck = False
+        new_balls.add(new_ball)
+    
+    original_ball.kill()
+    return new_balls
+
+def group_draw_with_offset(self, surface, offset=(0,0)):
+    for sprite in self.sprites():
+        surface.blit(sprite.image, (sprite.rect.x+offset[0], 
+                                  sprite.rect.y+offset[1]))
+
+pygame.sprite.Group.draw = group_draw_with_offset
+
+def main():
+    global SCREEN_SHAKE, BG_OFFSET, SCREEN_WIDTH, SCREEN_HEIGHT, FULLSCREEN_MODE, screen, SHAKE_DURATION
+    
+    # 创建渐变背景
+    gradient = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+    for y in range(SCREEN_HEIGHT):
+        color = tuple(
+            c1*(y/SCREEN_HEIGHT) + c2*(1-y/SCREEN_HEIGHT)
+            for c1, c2 in zip(COLORS['background'], COLORS['background2'])
+        )
+        pygame.draw.line(gradient, color, (0,y), (SCREEN_WIDTH,y))
+    
+    clock = pygame.time.Clock()
+    current_level = 1
+    game_over = False
+
+    paddle = Paddle()
+    ball = Ball(paddle)
+    brick_group = generate_bricks(current_level)
+    all_sprites = pygame.sprite.Group(paddle, brick_group)
+    ball_group = pygame.sprite.Group(ball)
+    all_sprites.add(ball_group)
+
+    # ==== 新增内容：标题字体初始化 ====
+    try:
+        title_font = pygame.font.SysFont("microsoftyahei", 48)  # 更大的标题字体
+    except:
+        title_font = pygame.font.SysFont("arial", 48, bold=True)
+    neon_purple = (128, 0, 255)       # 霓虹紫色
+    title_color = (30, 215, 96)       # Spotify绿作为主色
+    outline_color = (255, 50, 50)     # 红色轮廓
+    # ==== 新增内容：关卡字体初始化 ====
+    try:
+        level_font = pygame.font.SysFont("microsoftyahei", 30)  # 比标题小一号
+    except:
+        level_font = pygame.font.SysFont("arial", 30, bold=True)
+    level_color = (255, 215, 0)       # 金色
+    level_outline = (200, 50, 50)     # 暗红色轮廓
+    try:
+        credit_font = pygame.font.SysFont("microsoftyahei", 14)
+    except:
+        credit_font = pygame.font.SysFont("arial", 14)
+
+    while not game_over:
+        # 背景滚动
+        BG_OFFSET = (BG_OFFSET + 1) % SCREEN_HEIGHT
+        screen.blit(gradient, (0, BG_OFFSET - SCREEN_HEIGHT))
+        screen.blit(gradient, (0, BG_OFFSET))
+        
+        # 屏幕震动处理
+        shake_offset = (random.uniform(-SCREEN_SHAKE, SCREEN_SHAKE),
+                       random.uniform(-SCREEN_SHAKE, SCREEN_SHAKE)) 
+        if SHAKE_DURATION > 0:
+            SCREEN_SHAKE = int(10 * SHAKE_DURATION/10)
+            SHAKE_DURATION -= 1
+        else:
+            SCREEN_SHAKE = 0
+
+        # ==== 新增内容：绘制动态标题 ====
+        top_bar_height = int(SCREEN_HEIGHT * 0.08)  # 8%屏幕高度
+        glow_size = int(5 * abs(math.sin(pygame.time.get_ticks()*0.005)))
+        
+        # 绘制渐变背景条
+        title_bg = pygame.Surface((SCREEN_WIDTH, top_bar_height))
+        for x in range(SCREEN_WIDTH):
+            alpha = int(255 * (0.3 + 0.2*math.sin(x/50)))
+            pygame.draw.line(title_bg, (*COLORS['background2'], alpha), (x,0), (x,top_bar_height))
+        
+        # 添加扫描线效果
+        scan_line = pygame.Surface((SCREEN_WIDTH, 2))
+        scan_line.fill((255, 255, 255, 50))
+        scan_y = (pygame.time.get_ticks()//20) % top_bar_height
+        title_bg.blit(scan_line, (0, scan_y))
+        
+        # 创建带轮廓的文字
+        gamename = "量子冲击"   # CYBER BREAKER
+        text_surface = title_font.render(gamename, True, title_color)
+        outline_surface = title_font.render(gamename, True, outline_color)
+        
+        # 文字光晕效果
+        glow_surface = pygame.Surface((text_surface.get_width()+glow_size*2, 
+                                     text_surface.get_height()+glow_size*2), pygame.SRCALPHA)
+        for i in range(glow_size):
+            alpha = int(255 * (1 - i/glow_size))
+            glow_surface.fill((*outline_color, alpha//4))
+            pygame.draw.rect(glow_surface, (*outline_color, alpha), 
+                            (i, i, glow_surface.get_width()-2*i, glow_surface.get_height()-2*i), 
+                            border_radius=3)
+        
+        # 组合所有元素
+        final_surface = pygame.Surface((SCREEN_WIDTH, top_bar_height), pygame.SRCALPHA)
+        final_surface.blit(title_bg, (0,0))
+        final_surface.blit(glow_surface, 
+                          (SCREEN_WIDTH//2 - glow_surface.get_width()//2,
+                           top_bar_height//2 - glow_surface.get_height()//2))
+        final_surface.blit(outline_surface, 
+                          (SCREEN_WIDTH//2 - outline_surface.get_width()//2 + 2,
+                           top_bar_height//2 - outline_surface.get_height()//2 + 2))
+        final_surface.blit(text_surface, 
+                          (SCREEN_WIDTH//2 - text_surface.get_width()//2,
+                           top_bar_height//2 - text_surface.get_height()//2))
+
+        # ==== 在原有标题绘制代码后添加 ====
+        # 生成关卡文本（带轮廓）
+        level_text = f"第 {current_level:03d} 关"
+        
+        # 主文本
+        level_surf = level_font.render(level_text, True, level_color)
+        # 轮廓文本（扩大2像素）
+        level_outline_surf = level_font.render(level_text, True, level_outline)
+        
+        # 创建组合Surface（包含轮廓）
+        level_final = pygame.Surface(
+            (level_surf.get_width()+4, level_surf.get_height()+4), 
+            pygame.SRCALPHA
+        )
+        # 绘制轮廓（四个方向偏移）
+        level_final.blit(level_outline_surf, (0, 0))  # 左上
+        level_final.blit(level_outline_surf, (4, 0))  # 右上
+        level_final.blit(level_outline_surf, (0, 4))  # 左下
+        level_final.blit(level_outline_surf, (4, 4))  # 右下
+        # 绘制主文本
+        level_final.blit(level_surf, (2, 2))
+        
+        # 数字脉冲动画（尺寸变化）
+        scale_factor = 1 + 0.1 * math.sin(pygame.time.get_ticks()*0.005)
+        scaled_level = pygame.transform.smoothscale(
+            level_final,
+            (int(level_final.get_width() * scale_factor),
+            int(level_final.get_height() * scale_factor)))
+        
+        # 定位到右上角（留出20像素边距）
+        level_pos = (SCREEN_WIDTH - scaled_level.get_width() - 20, 
+                    (top_bar_height - scaled_level.get_height()) // 2)
+        final_surface.blit(scaled_level, level_pos)
+
+        # 绘制开发团队信息
+        credit_text = credit_font.render("Developed by DeepSeek, Directed by Dai Bo", True, (200, 200, 200))
+        text_rect = credit_text.get_rect(bottomright=(SCREEN_WIDTH - 20, SCREEN_HEIGHT - 10))
+        screen.blit(credit_text, text_rect)        
+        screen.blit(final_surface, (0, 0))  # 不受屏幕震动影响
+
+        # 事件处理
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
+                pygame.quit()
+                sys.exit()
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                for b in ball_group:
+                    if b.is_stuck:
+                        b.launch()
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_f:
+                try:
+                    new_width, new_height = (1280, 720) if FULLSCREEN_MODE else (display_info.current_w, display_info.current_h)
+                    screen = pygame.display.set_mode(
+                        (new_width, new_height),
+                        pygame.FULLSCREEN * (not FULLSCREEN_MODE) | pygame.HWSURFACE | pygame.DOUBLEBUF
+                    )
+                    SCREEN_WIDTH, SCREEN_HEIGHT = new_width, new_height
+                    FULLSCREEN_MODE = not FULLSCREEN_MODE
+                    paddle = Paddle()
+                    ball = Ball(paddle)
+                    brick_group = generate_bricks(current_level)
+                    all_sprites = pygame.sprite.Group(paddle, brick_group)
+                    ball_group = pygame.sprite.Group(ball)
+                    all_sprites.add(ball_group)
+                except Exception as e:
+                    print(f"显示模式切换失败: {e}")
+
+        # 更新游戏状态
+        paddle.update()
+        
+        active_balls = 0
+        for b in ball_group:
+            b.update()
+            if not b.is_lost:
+                active_balls += 1
+        if active_balls == 0:
+            game_over = True
+        
+        # 碰撞检测
+        for ball in ball_group:
+            if not ball.is_lost:
+                if pygame.sprite.collide_rect(ball, paddle):
+                    if ball.bounce(paddle):
+                        for _ in range(8):
+                            pos = (random.randint(ball.rect.left, ball.rect.right),
+                                  random.randint(ball.rect.top, ball.rect.bottom))
+                            PARTICLE_GROUP.add(Particle(pos, COLORS['particle']))
+                
+                hit_bricks = pygame.sprite.spritecollide(ball, brick_group, True)
+                if hit_bricks:
+                    ball.speed_y *= -1
+                    # 粒子效果
+                    for _ in range(15):
+                        PARTICLE_GROUP.add(Particle(ball.rect.center, COLORS['particle']))
+                    # 音效处理
+                    pan = (ball.rect.centerx - SCREEN_WIDTH/2) / (SCREEN_WIDTH/2)
+                    audio_manager.play('brick', pan=pan)
+                    
+                    split_done = False
+                    for brick in hit_bricks:
+                        if brick.is_reward:
+                            paddle.powerup_timer = 300  # 5秒效果
+                            SHAKE_DURATION = 5
+                            if ball.can_split and not split_done:
+                                new_balls = split_ball(ball, paddle)
+                                ball_group.add(new_balls)
+                                all_sprites.add(new_balls)
+                                ball.can_split = False
+                                split_done = True
+
+        # 更新粒子系统
+        PARTICLE_GROUP.update()
+        
+        # 关卡推进
+        if not brick_group:
+            current_level += 1
+            brick_group = generate_bricks(current_level)
+            all_sprites.add(brick_group)
+            
+            for b in ball_group:
+                b.kill()
+            new_ball = Ball(paddle)
+            ball_group.add(new_ball)
+            all_sprites.add(new_ball)
+
+        # 绘制所有元素
+        all_sprites.draw(screen, offset=shake_offset)
+        PARTICLE_GROUP.draw(screen, offset=shake_offset)
+        for b in ball_group:
+            b.draw_trail(screen)
+        
+        pygame.display.flip()
+        clock.tick(60)
+
+    print(f"游戏结束！最高关卡：{current_level}")
+    pygame.quit()
+
+if __name__ == "__main__":
+    main()
